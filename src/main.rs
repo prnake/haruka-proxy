@@ -5,11 +5,13 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
     Json, Router,
+    extract::DefaultBodyLimit,
 };
 use once_cell::sync::Lazy;
 use serde_json::{json, Value};
 use std::{collections::HashMap, fs, net::SocketAddr, sync::Arc};
 use tokio::{net::TcpListener, sync::RwLock, time::{Duration, sleep}};
+use tower_http::limit::RequestBodyLimitLayer;
 use tracing::{error, info};
 
 // 应用状态
@@ -44,6 +46,9 @@ async fn main() {
     let app = Router::new()
         .route("/v1/chat/completions", post(handle_post))
         .route("/msgs_forward/{domain}/v1/chat/completions", post(handle_msgs_forward))
+        .route("/chat_forward/{domain_type}/v1/chat/completions", post(handle_chat_completions_forward))
+        .layer(DefaultBodyLimit::disable())
+        .layer(RequestBodyLimitLayer::new(1024 * 1024 * 1024))
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 30033));
@@ -81,16 +86,16 @@ async fn update_models(
     let mut new_map = HashMap::new();
     if let Some(list) = json_resp.get("data").and_then(|d| d.as_array()) {
         for item in list {
-            if let (Some(id), Some(route)) = (item.get("id").and_then(|id| id.as_str()), item.get("id").and_then(|id| id.as_str())) {
-                // 此处简化，将id映射为自身。如有模型别名请在此处理
-                new_map.insert(id.to_string(), route.to_string());
+            if let Some(id_full) = item.get("id").and_then(|id| id.as_str()) {
+                let id = id_full.split('/').nth(1).unwrap_or(id_full);
+                new_map.insert(id.to_string(), id_full.to_string());
             }
         }
     }
 
     // 若拉到有效数据再替换原map
     if !new_map.is_empty() {
-        let mut map = model_map.write().await;
+        let mut map: tokio::sync::RwLockWriteGuard<'_, HashMap<String, String>> = model_map.write().await;
         *map = new_map;
         info!("Model map updated from openrouter.ai");
     } else {
@@ -165,6 +170,10 @@ fn handle_model_name<'a>(model_name: &'a str, model_map: &'a HashMap<String, Str
         }
     }
 
+    if let Some(pos) = name.find(':') {
+        name = &name[..pos];
+    }
+
     if let Some(mapped) = model_map.get(name) {
         return mapped.clone();
     }
@@ -186,6 +195,67 @@ fn handle_model_name<'a>(model_name: &'a str, model_map: &'a HashMap<String, Str
     }
 
     name.to_string()
+}
+
+async fn handle_chat_completions_forward(
+    State(state): State<AppState>,
+    Path(domain_type): Path<String>,
+    headers: HeaderMap,
+    Json(mut body): Json<Value>,
+) -> impl IntoResponse {
+    if !headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map_or(false, |v| v.starts_with("application/json"))
+    {
+        return (StatusCode::BAD_REQUEST, "Unsupported content type").into_response();
+    }
+
+    // Strip the first colon and its prefix from model for this route if present
+    if let Some(model) = body.get("model").and_then(|m| m.as_str()) {
+        if let Some(pos) = model.find(':') {
+            let new_model = &model[(pos+1)..];
+            body["model"] = json!(new_model);
+        }
+    }
+
+    let mut forward_headers = HeaderMap::new();
+    forward_headers.insert("content-type", "application/json".parse().unwrap());
+    if let Some(auth) = headers.get("authorization") {
+        forward_headers.insert("authorization", auth.clone());
+    }
+
+    let target_url = match domain_type.as_str() {
+        "minimax" => "https://api.minimaxi.com/v1/text/chatcompletion_v2",
+        _ => return (StatusCode::BAD_REQUEST, "Unsupported domain type").into_response(),
+    };
+
+    let res = state.client
+        .post(target_url)
+        .headers(forward_headers)
+        .json(&body)
+        .send()
+        .await;
+
+    match res {
+        Ok(resp) => {
+            let mut response_builder = Response::builder().status(resp.status());
+            if let Some(headers) = response_builder.headers_mut() {
+                *headers = resp.headers().clone();
+            }
+            response_builder
+                .body(Body::from_stream(resp.bytes_stream()))
+                .unwrap()
+        }
+        Err(err) => {
+            error!("Forward request to {} failed: {}", domain_type, err);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Error forwarding to {}: {}", domain_type, err),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn handle_msgs_forward(
@@ -213,10 +283,78 @@ async fn handle_msgs_forward(
     let mut forward_headers = HeaderMap::new();
     forward_headers.insert("content-type", "application/json".parse().unwrap());
     if let Some(auth) = headers.get("authorization") {
-        forward_headers.insert("authorization", auth.clone());
+        // forward_headers.insert("authorization", auth.clone());
+        if let Ok(auth_str) = auth.to_str() {
+            let token = auth_str.strip_prefix("Bearer ").unwrap_or(auth_str);
+            forward_headers.insert("x-api-key", token.parse().unwrap());
+        }
+    }
+    if let Some(auth) = headers.get("x-api-key") {
+        forward_headers.insert("x-api-key", auth.clone());
     }
 
-    let target_url = format!("https://{}/v1/messages", domain);
+    // for (key, value) in headers.iter() {
+    //     // Skip headers that are already handled explicitly above
+    //     let key_str = key.as_str().to_ascii_lowercase();
+    //     if key_str == "content-type" || key_str == "authorization" || key_str == "x-api-key" {
+    //         continue;
+    //     }
+    //     forward_headers.append(key, value.clone());
+    // }
+
+    // 检查 body 中是否含有 anthropic-beta 或 anthropic_beta
+    if let Some(beta_val) = body.get("anthropic-beta").or_else(|| body.get("anthropic_beta")) {
+        if beta_val.is_array() {
+            let arr = beta_val.as_array().unwrap();
+            let vals: Vec<String> = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+            let beta_str = vals.join(",");
+            forward_headers.insert("anthropic-beta", beta_str.parse().unwrap());
+        } else if beta_val.is_string() {
+            let beta_str = beta_val.as_str().unwrap();
+            forward_headers.insert("anthropic-beta", beta_str.parse().unwrap());
+        }
+    }
+
+    // anthropic-version header 检查，不存在则设置为 2023-06-01
+    let anthropic_version = headers
+        .get("anthropic-version")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("2023-06-01");
+
+    let anthropic_beta = headers
+        .get("anthropic-beta")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    forward_headers.insert("anthropic-version", anthropic_version.to_string().parse().unwrap());
+    if !anthropic_beta.is_empty() {
+        forward_headers.insert("anthropic-beta", anthropic_beta.to_string().parse().unwrap());
+    }
+
+    // 如果 anthropic-version 存在且不是 2023-06-01，则返回 400
+    if anthropic_version != "2023-06-01" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "API version not supported"
+                }
+            })),
+        ).into_response();
+    }
+
+    let target_url = match domain.as_str() {
+        "minimax" => "https://api.minimaxi.com/anthropic/v1/messages".to_string(),
+        _ => format!("https://{}/v1/messages", domain),
+    };
+
+    if body.get("n").is_some() {
+        body.as_object_mut().map(|m| m.remove("n"));
+    }
 
     let res = state.client
         .post(&target_url)
