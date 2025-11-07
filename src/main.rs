@@ -119,9 +119,13 @@ async fn handle_post(
 
     let model_map_guard = state.model_map.read().await;
 
-    if let Some(model_val) = body.get("model").and_then(|m| m.as_str()) {
+    let model_val_opt = body.get("model").and_then(|m| m.as_str()).map(|s| s.to_string());
+    if let Some(model_val) = model_val_opt.as_deref() {
         let mapped_model = handle_model_name(model_val, &*model_map_guard);
         body["model"] = json!(mapped_model);
+        if model_val.ends_with(":z-ai") {
+            body["provider"] = json!({ "only": ["parasail/fp8"] });
+        }
     } else {
         return (StatusCode::BAD_REQUEST, "Missing model").into_response();
     }
