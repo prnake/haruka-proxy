@@ -124,7 +124,7 @@ async fn handle_post(
         let mapped_model = handle_model_name(model_val, &*model_map_guard);
         body["model"] = json!(mapped_model);
         if model_val.ends_with(":z-ai") {
-            body["provider"] = json!({ "only": ["parasail/fp8"] });
+            body["provider"] = json!({ "only": ["z-ai"], "allow_fallbacks": false });
         }
     } else {
         return (StatusCode::BAD_REQUEST, "Missing model").into_response();
@@ -331,6 +331,11 @@ async fn handle_msgs_forward(
     let anthropic_beta = headers
         .get("anthropic-beta")
         .and_then(|v| v.to_str().ok())
+        .or_else(|| {
+            body.get("anthropic-beta")
+                .or_else(|| body.get("anthropic_beta"))
+                .and_then(|v| v.as_str())
+        })
         .unwrap_or("");
 
     forward_headers.insert("anthropic-version", anthropic_version.to_string().parse().unwrap());
@@ -356,8 +361,10 @@ async fn handle_msgs_forward(
         _ => format!("https://{}/v1/messages", domain),
     };
 
-    if body.get("n").is_some() {
-        body.as_object_mut().map(|m| m.remove("n"));
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("n");
+        obj.remove("anthropic-beta");
+        obj.remove("anthropic_beta");
     }
 
     let res = state.client
