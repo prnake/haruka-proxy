@@ -284,17 +284,27 @@ async fn handle_msgs_forward(
         }
     }
 
+    // 检查 body 中是否有 provider 字段
+    let provider = body.get("provider").and_then(|p| p.as_str());
+
     let mut forward_headers = HeaderMap::new();
     forward_headers.insert("content-type", "application/json".parse().unwrap());
     if let Some(auth) = headers.get("authorization") {
         // forward_headers.insert("authorization", auth.clone());
         if let Ok(auth_str) = auth.to_str() {
-            let token = auth_str.strip_prefix("Bearer ").unwrap_or(auth_str);
+            let mut token = auth_str.strip_prefix("Bearer ").unwrap_or(auth_str).to_string();
+            if let Some(provider_val) = provider {
+                token = format!("{}-{}", token, provider_val);
+            }
             forward_headers.insert("x-api-key", token.parse().unwrap());
         }
     }
     if let Some(auth) = headers.get("x-api-key") {
-        forward_headers.insert("x-api-key", auth.clone());
+        let mut token = auth.to_str().unwrap_or("").to_string();
+        if let Some(provider_val) = provider {
+            token = format!("{}-{}", token, provider_val);
+        }
+        forward_headers.insert("x-api-key", token.parse().unwrap());
     }
 
     // for (key, value) in headers.iter() {
@@ -305,22 +315,6 @@ async fn handle_msgs_forward(
     //     }
     //     forward_headers.append(key, value.clone());
     // }
-
-    // 检查 body 中是否含有 anthropic-beta 或 anthropic_beta
-    if let Some(beta_val) = body.get("anthropic-beta").or_else(|| body.get("anthropic_beta")) {
-        if beta_val.is_array() {
-            let arr = beta_val.as_array().unwrap();
-            let vals: Vec<String> = arr
-                .iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect();
-            let beta_str = vals.join(",");
-            forward_headers.insert("anthropic-beta", beta_str.parse().unwrap());
-        } else if beta_val.is_string() {
-            let beta_str = beta_val.as_str().unwrap();
-            forward_headers.insert("anthropic-beta", beta_str.parse().unwrap());
-        }
-    }
 
     // anthropic-version header 检查，不存在则设置为 2023-06-01
     let anthropic_version = headers
@@ -365,6 +359,7 @@ async fn handle_msgs_forward(
         obj.remove("n");
         obj.remove("anthropic-beta");
         obj.remove("anthropic_beta");
+        obj.remove("provider");
     }
 
     let res = state.client
