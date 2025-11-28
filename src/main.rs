@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    extract::{State, Path},
+    extract::{State, Path, Query},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
@@ -13,6 +13,7 @@ use std::{collections::HashMap, fs, net::SocketAddr, sync::Arc};
 use tokio::{net::TcpListener, sync::RwLock, time::{Duration, sleep}};
 use tower_http::limit::RequestBodyLimitLayer;
 use tracing::{error, info};
+use std::collections::HashMap as StdHashMap;
 
 // 应用状态
 #[derive(Clone)]
@@ -46,6 +47,7 @@ async fn main() {
     let app = Router::new()
         .route("/v1/chat/completions", post(handle_post))
         .route("/msgs_forward/{domain}/v1/chat/completions", post(handle_msgs_forward))
+        .route("/msgs_forward/{domain}/v1/messages", post(handle_msgs_forward))
         .route("/chat_forward/{domain_type}/v1/chat/completions", post(handle_chat_completions_forward))
         .layer(DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(1024 * 1024 * 1024))
@@ -265,6 +267,7 @@ async fn handle_chat_completions_forward(
 async fn handle_msgs_forward(
     State(state): State<AppState>,
     Path(domain): Path<String>,
+    Query(query): Query<StdHashMap<String, String>>,
     headers: HeaderMap,
     Json(mut body): Json<Value>,
 ) -> impl IntoResponse {
@@ -290,7 +293,6 @@ async fn handle_msgs_forward(
     let mut forward_headers = HeaderMap::new();
     forward_headers.insert("content-type", "application/json".parse().unwrap());
     if let Some(auth) = headers.get("authorization") {
-        // forward_headers.insert("authorization", auth.clone());
         if let Ok(auth_str) = auth.to_str() {
             let mut token = auth_str.strip_prefix("Bearer ").unwrap_or(auth_str).to_string();
             if let Some(provider_val) = provider {
@@ -306,15 +308,6 @@ async fn handle_msgs_forward(
         }
         forward_headers.insert("x-api-key", token.parse().unwrap());
     }
-
-    // for (key, value) in headers.iter() {
-    //     // Skip headers that are already handled explicitly above
-    //     let key_str = key.as_str().to_ascii_lowercase();
-    //     if key_str == "content-type" || key_str == "authorization" || key_str == "x-api-key" {
-    //         continue;
-    //     }
-    //     forward_headers.append(key, value.clone());
-    // }
 
     // anthropic-version header 检查，不存在则设置为 2023-06-01
     let anthropic_version = headers
@@ -362,8 +355,16 @@ async fn handle_msgs_forward(
         obj.remove("provider");
     }
 
+    // 拼接 query string
+    let url_with_query = if query.is_empty() {
+        target_url
+    } else {
+        let qs = serde_urlencoded::to_string(&query).unwrap_or_default();
+        format!("{}?{}", target_url, qs)
+    };
+
     let res = state.client
-        .post(&target_url)
+        .post(&url_with_query)
         .headers(forward_headers)
         .json(&body)
         .send()
