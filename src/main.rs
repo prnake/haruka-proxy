@@ -35,7 +35,17 @@ async fn main() {
     tracing_subscriber::fmt().with_env_filter("info").init();
 
     let model_map = Arc::new(RwLock::new(INITIAL_MODEL_MAP.clone()));
-    let client = reqwest::Client::new();
+    
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3600))  // 1小时超时
+        .pool_max_idle_per_host(10000)        // 增大连接池
+        .pool_idle_timeout(Duration::from_secs(90))
+        .tcp_keepalive(Duration::from_secs(3600))
+        .tcp_nodelay(true)                  // 禁用 Nagle 算法，减少延迟
+        .http2_adaptive_window(true)        // HTTP/2 自适应窗口
+        .build()
+        .expect("Failed to build HTTP client");
+    
     let state = AppState {
         model_map: model_map.clone(),
         client: client.clone(),
@@ -49,6 +59,7 @@ async fn main() {
         .route("/msgs_forward/{domain}/v1/chat/completions", post(handle_msgs_forward))
         .route("/msgs_forward/{domain}/v1/messages", post(handle_msgs_forward))
         .route("/chat_forward/{domain_type}/v1/chat/completions", post(handle_chat_completions_forward))
+        .route("/gemini_forward/{domain}/v1/chat/completions", post(handle_gemini_forward))
         .layer(DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(1024 * 1024 * 1024))
         .with_state(state);
@@ -379,6 +390,136 @@ async fn handle_msgs_forward(
             response_builder
                 .body(Body::from_stream(resp.bytes_stream()))
                 .unwrap()
+        }
+        Err(err) => {
+            error!("Forward request to {} failed: {}", domain, err);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Error forwarding to {}: {}", domain, err),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn handle_gemini_forward(
+    State(state): State<AppState>,
+    Path(domain): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    if !headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map_or(false, |v| v.starts_with("application/json"))
+    {
+        return (StatusCode::BAD_REQUEST, "Unsupported content type").into_response();
+    }
+    
+    // Strip the first colon and its prefix from model for this route if present
+    let model = match body.get("model").and_then(|m| m.as_str()) {
+        Some(model) => {
+            if let Some(pos) = model.find(':') {
+                &model[(pos + 1)..]
+            } else {
+                model
+            }
+        }
+        None => return (StatusCode::BAD_REQUEST, "Missing model").into_response(),
+    };
+
+    // 拿 messages[0]["content"]
+    let messages: Value = match body.get("messages")
+        .and_then(|msgs| msgs.as_array())
+        .and_then(|msgs_arr| msgs_arr.get(0))
+        .and_then(|first_msg| first_msg.get("content"))
+        .cloned()
+    {
+        Some(content) => content,
+        None => return (StatusCode::BAD_REQUEST, "Missing `messages[0].content`").into_response(),
+    };
+
+    // 构建转发 URL
+    let target_url = format!("https://{}/v1beta/models/{}:generateContent", domain, model);
+
+    // 从 header 读取 authorization，去掉 Bearer 前缀
+    let mut forward_headers = reqwest::header::HeaderMap::new();
+    forward_headers.insert("content-type", "application/json".parse().unwrap());
+    
+    if let Some(auth) = headers.get("authorization") {
+        if let Ok(auth_str) = auth.to_str() {
+            let access_token = auth_str.strip_prefix("Bearer ").unwrap_or(auth_str);
+            forward_headers.insert("x-goog-api-key", access_token.parse().unwrap());
+        }
+    }
+
+    // 发送请求，body 是 messages
+    let res = state
+        .client
+        .post(&target_url)
+        .headers(forward_headers)
+        .json(&messages)
+        .send()
+        .await;
+
+    match res {
+        Ok(resp) => {
+            let status = resp.status();
+            
+            // 使用 bytes 而不是 text，避免 UTF-8 验证开销
+            let response_bytes = match resp.bytes().await {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    error!("Failed to read response from {}: {}", domain, err);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Error reading response: {}", err),
+                    )
+                        .into_response();
+                }
+            };
+            
+            // 尝试解析 JSON
+            match serde_json::from_slice::<Value>(&response_bytes) {
+                Ok(data) => {
+                    // 提取 usageMetadata
+                    let mut response_json = json!({
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "message": data
+                        }]
+                    });
+
+                    if let Some(usage_metadata) = data.get("usageMetadata") {
+                        if let (Some(prompt_tokens), Some(total_tokens)) = (
+                            usage_metadata.get("promptTokenCount").and_then(|v| v.as_u64()),
+                            usage_metadata.get("totalTokenCount").and_then(|v| v.as_u64()),
+                        ) {
+                            let completion_tokens = total_tokens.saturating_sub(prompt_tokens);
+                            response_json["usage"] = json!({
+                                "prompt_tokens": prompt_tokens,
+                                "completion_tokens": completion_tokens,
+                                "total_tokens": total_tokens
+                            });
+                        }
+                    }
+
+                    Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&response_json).unwrap_or_default()))
+                        .unwrap()
+                }
+                Err(_) => {
+                    // JSON 解析失败，直接转发原始响应
+                    Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(Body::from(response_bytes))
+                        .unwrap()
+                }
+            }
         }
         Err(err) => {
             error!("Forward request to {} failed: {}", domain, err);
