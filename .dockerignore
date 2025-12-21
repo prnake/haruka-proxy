@@ -1,0 +1,24 @@
+# Build artifacts
+target/
+*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+*.md
+!README.md
+
+# Other
+proxy-bedrock/
+worker.js
+test.sh
+*.log
+
