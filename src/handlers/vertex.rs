@@ -1,10 +1,11 @@
 use axum::{
     body::Body,
-    extract::State,
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::{error, info};
 
@@ -468,6 +469,237 @@ pub async fn handle_count_tokens_endpoint(
                 "api_error",
                 "Server Error",
             )
+        }
+    }
+}
+
+/// Gemini API 查询参数
+#[derive(Debug, Deserialize)]
+pub struct GeminiQueryParams {
+    /// 用户 API key（用于认证）
+    pub key: String,
+    /// 可选：指定凭证别名
+    pub provider: Option<String>,
+    /// 可选：指定区域
+    pub location: Option<String>,
+}
+
+/// 获取 Gemini API 的认证信息
+async fn get_gemini_auth_and_credentials(
+    state: &AppState,
+    api_key: &str,
+    provider_alias: Option<&str>,
+) -> Result<AuthResult, Response> {
+    // 解析 key，支持 `key;region=xxx` 格式
+    let (auth_token, override_region) = if api_key.contains(';') {
+        let parts: Vec<&str> = api_key.splitn(2, ';').collect();
+        let mut region = String::new();
+        if parts.len() > 1 {
+            for part in parts[1].split(';') {
+                if let Some((k, v)) = part.split_once('=') {
+                    if k == "region" {
+                        region = v.to_string();
+                    }
+                }
+            }
+        }
+        (parts[0].to_string(), region)
+    } else {
+        (api_key.to_string(), String::new())
+    };
+
+    // 查找用户
+    let user = match find_vertex_user(&auth_token) {
+        Some(u) => u,
+        None => {
+            return Err(create_error_response(
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                "Invalid API key",
+            ));
+        }
+    };
+
+    // 获取凭证（指定或随机）
+    let (alias, gcp_credentials) = match get_vertex_credential(provider_alias, &user.allowed_aliases) {
+        Some(result) => result,
+        None => {
+            let msg = if let Some(p) = provider_alias {
+                format!("Provider '{}' not found or not allowed", p)
+            } else {
+                "No available credentials".to_string()
+            };
+            return Err(create_error_response(
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                &msg,
+            ));
+        }
+    };
+
+    info!(
+        "Gemini API - User '{}' using credential '{}' (permission: {:?})",
+        user.user_name, alias, user.permission
+    );
+
+    // 创建 JWT 并交换访问令牌
+    let signed_jwt = match create_signed_jwt(&gcp_credentials.client_email, &gcp_credentials.private_key).await {
+        Ok(jwt) => jwt,
+        Err(e) => {
+            error!("Failed to create JWT: {}", e);
+            return Err(create_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                "invalid authentication credentials",
+            ));
+        }
+    };
+
+    let access_token = match exchange_jwt_for_access_token(&signed_jwt, &state.client).await {
+        Ok(token) => token,
+        Err(e) => {
+            error!("Failed to exchange JWT for access token: {}", e);
+            return Err(create_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                "invalid authentication credentials",
+            ));
+        }
+    };
+
+    Ok(AuthResult {
+        access_token,
+        override_region,
+        gcp_credentials,
+        permission: user.permission,
+        credential_alias: alias,
+    })
+}
+
+/// 处理 Gemini API 端点
+/// 路由: /v1beta/models/{model}:{action}
+/// 例如: /v1beta/models/gemini-3-pro-image-preview:streamGenerateContent?key=xxx
+pub async fn handle_gemini_endpoint(
+    State(state): State<AppState>,
+    Path(model_action): Path<String>,
+    Query(params): Query<GeminiQueryParams>,
+    body: String,
+) -> impl IntoResponse {
+    // 解析 model:action 格式
+    let (model_name, action) = match model_action.rsplit_once(':') {
+        Some((m, a)) => (m.to_string(), a.to_string()),
+        None => {
+            return create_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "Invalid endpoint format. Expected: /v1beta/models/{model}:{action}",
+            );
+        }
+    };
+
+    // 支持从 location 参数覆盖区域
+    let location_override = params.location.clone();
+
+    // 获取认证信息
+    let auth = match get_gemini_auth_and_credentials(
+        &state,
+        &params.key,
+        params.provider.as_deref(),
+    ).await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    // 检查权限：只有 admin 可以调用 generateContent 接口
+    if auth.permission != Permission::Admin {
+        return create_error_response(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            "Permission denied. This API key can only access count-tokens endpoint.",
+        );
+    }
+
+    // 确定区域（优先级：location 参数 > key 中的 region > 默认 global）
+    let location = if let Some(loc) = location_override {
+        loc
+    } else if !auth.override_region.is_empty() {
+        auth.override_region
+    } else {
+        "global".to_string()
+    };
+
+    // 构建 Vertex AI URL
+    // 目标: https://aiplatform.googleapis.com/v1/projects/${PROJECT_ID}/locations/global/publishers/google/models/${MODEL_ID}:generateContent
+    let url = format!(
+        "https://aiplatform.googleapis.com/v1/projects/{}/locations/{}/publishers/google/models/{}:{}",
+        auth.gcp_credentials.project_id, location, model_name, action
+    );
+
+    info!(
+        "Gemini API -> Vertex AI: model={}, action={}, location={}, credential={}",
+        model_name, action, location, auth.credential_alias
+    );
+
+    // 发送请求（透传 body）
+    let response = match state
+        .client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", auth.access_token))
+        .body(body)
+        .send()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            error!("Failed to send request to Vertex AI: {}", e);
+            return create_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                "Server Error",
+            );
+        }
+    };
+
+    let status = response.status();
+
+    // 检查是否是流式请求（streamGenerateContent）
+    let is_stream = action.contains("stream");
+
+    if is_stream {
+        // 流式响应
+        let stream = response.bytes_stream();
+        Response::builder()
+            .status(status)
+            .header("Content-Type", "text/event-stream")
+            .header("Access-Control-Allow-Origin", "*")
+            .body(Body::from_stream(stream))
+            .unwrap_or_else(|_| {
+                create_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "api_error",
+                    "Server Error",
+                )
+            })
+    } else {
+        // 非流式响应
+        match response.text().await {
+            Ok(data) => {
+                Response::builder()
+                    .status(status)
+                    .header("Content-Type", "application/json")
+                    .header("Access-Control-Allow-Origin", "*")
+                    .body(Body::from(data))
+                    .unwrap()
+            }
+            Err(e) => {
+                error!("Failed to read response: {}", e);
+                create_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "api_error",
+                    "Server Error",
+                )
+            }
         }
     }
 }
