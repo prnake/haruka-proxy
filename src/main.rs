@@ -23,7 +23,13 @@ use tracing::{error, info};
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt().with_env_filter("info").init();
+    // 使用环境变量 RUST_LOG，如果没有设置则默认为 info
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .init();
 
     let model_map = Arc::new(RwLock::new(INITIAL_MODEL_MAP.clone()));
 
@@ -48,14 +54,35 @@ async fn main() {
         .merge(vertex::create_router(state.clone()))
         .merge(bedrock::create_router(state));
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 30033));
+    // 从环境变量读取绑定地址，默认为 0.0.0.0:30033（Docker 友好）
+    let bind_host = std::env::var("BIND_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let bind_port: u16 = std::env::var("BIND_PORT")
+        .unwrap_or_else(|_| "30033".to_string())
+        .parse()
+        .unwrap_or(30033);
+    
+    let addr = SocketAddr::new(
+        bind_host.parse().unwrap_or_else(|_| {
+            error!("Invalid BIND_HOST: {}, using 0.0.0.0", bind_host);
+            "0.0.0.0".parse().unwrap()
+        }),
+        bind_port,
+    );
+    
     info!("🚀 Server listening on {}", addr);
 
-    let listener = TcpListener::bind(addr).await.unwrap();
+    let listener = TcpListener::bind(addr).await.unwrap_or_else(|e| {
+        error!("Failed to bind to {}: {}", addr, e);
+        std::process::exit(1);
+    });
+    
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .unwrap();
+        .unwrap_or_else(|e| {
+            error!("Server error: {}", e);
+            std::process::exit(1);
+        });
 }
 
 // 定时任务：每小时拉取 https://openrouter.ai/api/v1/models
