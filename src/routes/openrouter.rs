@@ -10,8 +10,9 @@ use crate::state::AppState;
 
 pub fn create_router(state: AppState) -> Router {
     Router::new()
-        .route("/v1/chat/completions", post(openrouter::handle_post))
-        .route(
+    .route("/v1/chat/completions", post(openrouter::handle_post))
+    .route("/v1/messages", post(openrouter::handle_messages))
+    .route(
             "/msgs_forward/{domain}/v1/chat/completions",
             post(openrouter::handle_msgs_forward),
         )

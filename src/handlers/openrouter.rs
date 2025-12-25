@@ -73,6 +73,65 @@ pub async fn handle_post(
     }
 }
 
+pub async fn handle_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(mut body): Json<Value>,
+) -> impl IntoResponse {
+    if !headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map_or(false, |v| v.starts_with("application/json"))
+    {
+        return (StatusCode::BAD_REQUEST, "Unsupported content type").into_response();
+    }
+
+    // 仅替换模型名称
+    let model_map_guard = state.model_map.read().await;
+
+    let model_val_opt = body.get("model").and_then(|m| m.as_str()).map(|s| s.to_string());
+    if let Some(model_val) = model_val_opt.as_deref() {
+        let mapped_model = handle_model_name(model_val, &*model_map_guard);
+        body["model"] = json!(mapped_model);
+    } else {
+        return (StatusCode::BAD_REQUEST, "Missing model").into_response();
+    }
+
+    let mut forward_headers = HeaderMap::new();
+    forward_headers.insert("content-type", "application/json".parse().unwrap());
+    if let Some(auth) = headers.get("authorization") {
+        forward_headers.insert("authorization", auth.clone());
+    }
+
+    let res = state
+        .client
+        .post("https://openrouter.ai/api/v1/messages")
+        .headers(forward_headers)
+        .json(&body)
+        .send()
+        .await;
+
+    match res {
+        Ok(resp) => {
+            let mut response_builder = Response::builder().status(resp.status());
+            if let Some(headers) = response_builder.headers_mut() {
+                *headers = resp.headers().clone();
+            }
+            response_builder
+                .body(Body::from_stream(resp.bytes_stream()))
+                .unwrap()
+        }
+        Err(err) => {
+            error!("Forward request failed: {}", err);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Error: {}", err),
+            )
+                .into_response()
+        }
+    }
+}
+
 pub async fn handle_chat_completions_forward(
     State(state): State<AppState>,
     axum::extract::Path(domain_type): axum::extract::Path<String>,
