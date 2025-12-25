@@ -100,7 +100,11 @@ pub async fn handle_messages(
     let mut forward_headers = HeaderMap::new();
     forward_headers.insert("content-type", "application/json".parse().unwrap());
     if let Some(auth) = headers.get("authorization") {
-        forward_headers.insert("authorization", auth.clone());
+        let value = format!("Bearer {}", auth.to_str().unwrap_or_default());
+        forward_headers.insert("authorization", value.parse().unwrap());
+    } else if let Some(x_api_key) = headers.get("x-api-key") {
+        let value = format!("Bearer {}", x_api_key.to_str().unwrap_or_default());
+        forward_headers.insert("authorization", value.parse().unwrap());
     }
 
     let res = state
