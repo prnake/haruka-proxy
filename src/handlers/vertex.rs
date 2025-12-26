@@ -5,7 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use reqwest::header::{HeaderMap as ReqwestHeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{HeaderMap as ReqwestHeaderMap, HeaderValue, CONTENT_TYPE};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::{error, info};
@@ -398,6 +398,7 @@ pub async fn handle_count_tokens_endpoint(
     // 转换模型名为 Vertex 格式，更新 payload
     let vertex_model_name = to_vertex_model_name(&model_name);
     payload["model"] = json!(vertex_model_name);
+    payload["anthropic_version"] = json!("vertex-2023-10-16");
 
     // 构建 URL
     let url = format!(
@@ -421,7 +422,7 @@ pub async fn handle_count_tokens_endpoint(
 
     // 确保鉴权和内容类型正确
     forward_headers.insert(
-        AUTHORIZATION,
+        "Authorization",
         HeaderValue::from_str(&format!("Bearer {}", auth.access_token))
             .unwrap_or_else(|_| HeaderValue::from_static("")),
     );
