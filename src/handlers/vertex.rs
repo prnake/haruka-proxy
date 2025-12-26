@@ -5,6 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use reqwest::header::{HeaderMap as ReqwestHeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::{error, info};
@@ -372,26 +373,6 @@ pub async fn handle_count_tokens_endpoint(
 
     // count_token 和 admin 权限都可以调用此接口
 
-    // 验证 Anthropic 版本
-    let anthropic_version = headers
-        .get("anthropic-version")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("2023-06-01");
-
-    if anthropic_version != "2023-06-01" {
-        return create_error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "API version not supported",
-        );
-    }
-
-    // 处理 payload
-    if let Some(obj) = payload.as_object_mut() {
-        obj.remove("n");
-        obj.insert("anthropic_version".to_string(), json!("vertex-2023-10-16"));
-    }
-
     // 获取模型名
     let model_name = payload
         .get("model")
@@ -429,13 +410,30 @@ pub async fn handle_count_tokens_endpoint(
         vertex_model_name, region, auth.credential_alias
     );
 
+    // 转发请求头，排除 x-api-key，其余保持原样
+    let mut forward_headers = ReqwestHeaderMap::new();
+    for (name, value) in headers.iter() {
+        if name == "x-api-key" {
+            continue;
+        }
+        forward_headers.insert(name.clone(), value.clone());
+    }
+
+    // 确保鉴权和内容类型正确
+    forward_headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {}", auth.access_token))
+            .unwrap_or_else(|_| HeaderValue::from_static("")),
+    );
+    if !forward_headers.contains_key(CONTENT_TYPE) {
+        forward_headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    }
+
     // 发送请求
     let request_builder = state
         .client
         .post(&url)
-        .header("Content-Type", "application/json")
-        .header("Authorization", format!("Bearer {}", auth.access_token))
-        .header("Anthropic-Version", anthropic_version)
+        .headers(forward_headers)
         .json(&payload);
 
     let response = match request_builder.send().await {
