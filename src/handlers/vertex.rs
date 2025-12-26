@@ -411,10 +411,10 @@ pub async fn handle_count_tokens_endpoint(
         vertex_model_name, region, auth.credential_alias
     );
 
-    // 转发请求头，排除 x-api-key，其余保持原样
+    // 转发请求头
     let mut forward_headers = ReqwestHeaderMap::new();
     for (name, value) in headers.iter() {
-        if name == "x-api-key" {
+        if !name.as_str().to_ascii_lowercase().starts_with("anthropic") {
             continue;
         }
         forward_headers.insert(name.clone(), value.clone());
