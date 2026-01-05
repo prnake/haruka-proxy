@@ -843,16 +843,27 @@ pub async fn handle_gemini_forward(
     // 构建目标 URL（使用 aiplatform.googleapis.com 作为基础域名）
     let target_url = format!("https://aiplatform.googleapis.com{}", provider_config.url);
 
-    // 发送请求
-    let response = match state
-        .client
-        .post(&target_url)
-        .header("Content-Type", "application/json")
-        .header("Authorization", format!("Bearer {}", access_token))
-        .json(&request_body)
-        .send()
-        .await
-    {
+    // 发送请求（如果 URL 以 /v1beta/interactions/ 开头则使用 GET，否则使用 POST）
+    let use_get = provider_config.url.starts_with("/v1beta/interactions/");
+    let response = if use_get {
+        state
+            .client
+            .get(&target_url)
+            .header("Authorization", format!("Bearer {}", access_token))
+            .send()
+            .await
+    } else {
+        state
+            .client
+            .post(&target_url)
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", access_token))
+            .json(&request_body)
+            .send()
+            .await
+    };
+
+    let response = match response {
         Ok(resp) => resp,
         Err(e) => {
             error!("Failed to send request to {}: {}", target_url, e);

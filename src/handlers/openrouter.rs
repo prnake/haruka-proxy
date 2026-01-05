@@ -362,7 +362,7 @@ pub async fn handle_gemini_forward(
     };
 
     // 构建转发 URL，同时获取 model（用于响应）
-    let (target_url, model_name) = if let Some(url_path) = custom_url {
+    let (target_url, model_name) = if let Some(ref url_path) = custom_url {
         // 使用自定义 URL 路径（如 /v1beta/interactions）
         // 对于自定义端点，model 从 body 中获取（可选）
         let model = body
@@ -399,14 +399,28 @@ pub async fn handle_gemini_forward(
         }
     }
 
-    // 发送请求，body 是 messages
-    let res = state
-        .client
-        .post(&target_url)
-        .headers(forward_headers)
-        .json(&messages)
-        .send()
-        .await;
+    // 发送请求（如果自定义 URL 以 /v1beta/interactions/ 开头则使用 GET，否则使用 POST）
+    let use_get = custom_url
+        .as_ref()
+        .map(|url| url.starts_with("/v1beta/interactions/"))
+        .unwrap_or(false);
+
+    let res = if use_get {
+        state
+            .client
+            .get(&target_url)
+            .headers(forward_headers)
+            .send()
+            .await
+    } else {
+        state
+            .client
+            .post(&target_url)
+            .headers(forward_headers)
+            .json(&messages)
+            .send()
+            .await
+    };
 
     match res {
         Ok(resp) => {
