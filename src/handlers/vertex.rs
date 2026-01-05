@@ -10,8 +10,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::{error, info};
 
+use std::env;
+
 use crate::auth::{create_signed_jwt, exchange_jwt_for_access_token};
-use crate::config::{find_vertex_user, get_vertex_credential, GcpCredential, Permission};
+use crate::config::{find_vertex_user, get_vertex_credential, GcpCredential, Permission, VERTEX_CREDENTIALS};
 use crate::models::{get_vertex_region, is_vertex_model, to_vertex_model_name};
 use crate::state::AppState;
 use crate::utils::create_error_response;
@@ -699,6 +701,232 @@ pub async fn handle_gemini_endpoint(
                     "Server Error",
                 )
             }
+        }
+    }
+}
+
+/// Gemini Forward 的 provider 配置
+#[derive(Debug, Deserialize)]
+struct GeminiForwardProvider {
+    /// 自定义 URL 路径（如 /v1beta/interactions）
+    url: String,
+    /// 账号别名（对应 VERTEX_{account} 环境变量）
+    account: String,
+}
+
+/// 处理 Gemini Forward 端点（通过 Vertex AI 凭证转发到 Gemini API）
+/// 路由: /vertex/gemini_forward/v1/chat/completions
+///
+/// 请求格式:
+/// {
+///   "model": "...",
+///   "provider": {"url": "/v1beta/interactions", "account": "A"},
+///   "messages": [{"role": "user", "content": {...}}]
+/// }
+///
+/// 如果环境变量 VERTEX_A 存在，则使用该凭证；否则返回 provider 不存在错误
+pub async fn handle_gemini_forward(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    // 检查 content-type
+    if !headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map_or(false, |v| v.starts_with("application/json"))
+    {
+        return create_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Unsupported content type",
+        );
+    }
+
+    // 解析 provider 配置
+    let provider_config: GeminiForwardProvider = match body.get("provider") {
+        Some(provider_val) => match serde_json::from_value(provider_val.clone()) {
+            Ok(config) => config,
+            Err(_) => {
+                return create_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "Invalid provider format. Expected: {\"url\": \"...\", \"account\": \"...\"}",
+                );
+            }
+        },
+        None => {
+            return create_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "Missing provider field",
+            );
+        }
+    };
+
+    // 查找凭证：首先从已加载的 VERTEX_CREDENTIALS 中查找，如果没有则尝试从环境变量动态加载
+    let gcp_credentials = if let Some(cred) = VERTEX_CREDENTIALS.get(&provider_config.account) {
+        cred.clone()
+    } else {
+        // 尝试从环境变量动态加载
+        let env_key = format!("VERTEX_{}", provider_config.account);
+        match env::var(&env_key) {
+            Ok(json_str) => match GcpCredential::from_json(&json_str) {
+                Ok(cred) => cred,
+                Err(e) => {
+                    error!("Failed to parse credential from {}: {}", env_key, e);
+                    return create_error_response(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        &format!("Provider '{}' credentials invalid", provider_config.account),
+                    );
+                }
+            },
+            Err(_) => {
+                return create_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    &format!("Provider '{}' not found", provider_config.account),
+                );
+            }
+        }
+    };
+
+    // 创建 JWT 并交换访问令牌
+    let signed_jwt = match create_signed_jwt(&gcp_credentials.client_email, &gcp_credentials.private_key).await {
+        Ok(jwt) => jwt,
+        Err(e) => {
+            error!("Failed to create JWT: {}", e);
+            return create_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                "invalid authentication credentials",
+            );
+        }
+    };
+
+    let access_token = match exchange_jwt_for_access_token(&signed_jwt, &state.client).await {
+        Ok(token) => token,
+        Err(e) => {
+            error!("Failed to exchange JWT for access token: {}", e);
+            return create_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                "invalid authentication credentials",
+            );
+        }
+    };
+
+    info!(
+        "Gemini Forward: account={}, url={}, project={}",
+        provider_config.account, provider_config.url, gcp_credentials.project_id
+    );
+
+    // 拿 messages[0]["content"] 作为请求体
+    let request_body: Value = match body
+        .get("messages")
+        .and_then(|msgs| msgs.as_array())
+        .and_then(|msgs_arr| msgs_arr.first())
+        .and_then(|first_msg| first_msg.get("content"))
+        .cloned()
+    {
+        Some(content) => content,
+        None => {
+            return create_error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "Missing `messages[0].content`",
+            );
+        }
+    };
+
+    // 构建目标 URL（使用 aiplatform.googleapis.com 作为基础域名）
+    let target_url = format!("https://aiplatform.googleapis.com{}", provider_config.url);
+
+    // 发送请求
+    let response = match state
+        .client
+        .post(&target_url)
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", access_token))
+        .json(&request_body)
+        .send()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            error!("Failed to send request to {}: {}", target_url, e);
+            return create_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                "Server Error",
+            );
+        }
+    };
+
+    let status = response.status();
+
+    // 获取模型名（用于响应）
+    let model_name = body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("custom")
+        .to_string();
+
+    // 读取响应
+    let response_bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            error!("Failed to read response: {}", e);
+            return create_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                "Server Error",
+            );
+        }
+    };
+
+    // 尝试解析 JSON 并包装成 OpenAI 格式
+    match serde_json::from_slice::<Value>(&response_bytes) {
+        Ok(data) => {
+            let mut response_json = json!({
+                "model": model_name,
+                "choices": [{
+                    "index": 0,
+                    "message": data
+                }]
+            });
+
+            // 提取 usageMetadata（如果存在）
+            if let Some(usage_metadata) = data.get("usageMetadata") {
+                if let (Some(prompt_tokens), Some(total_tokens)) = (
+                    usage_metadata.get("promptTokenCount").and_then(|v| v.as_u64()),
+                    usage_metadata.get("totalTokenCount").and_then(|v| v.as_u64()),
+                ) {
+                    let completion_tokens = total_tokens.saturating_sub(prompt_tokens);
+                    response_json["usage"] = json!({
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": total_tokens
+                    });
+                }
+            }
+
+            Response::builder()
+                .status(status)
+                .header("Content-Type", "application/json")
+                .header("Access-Control-Allow-Origin", "*")
+                .body(Body::from(serde_json::to_vec(&response_json).unwrap_or_default()))
+                .unwrap()
+        }
+        Err(_) => {
+            // JSON 解析失败，直接转发原始响应
+            Response::builder()
+                .status(status)
+                .header("Content-Type", "application/json")
+                .header("Access-Control-Allow-Origin", "*")
+                .body(Body::from(response_bytes))
+                .unwrap()
         }
     }
 }

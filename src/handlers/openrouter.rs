@@ -341,17 +341,13 @@ pub async fn handle_gemini_forward(
         return (StatusCode::BAD_REQUEST, "Unsupported content type").into_response();
     }
 
-    // Strip the first colon and its prefix from model for this route if present
-    let model = match body.get("model").and_then(|m| m.as_str()) {
-        Some(model) => {
-            if let Some(pos) = model.find(':') {
-                &model[(pos + 1)..]
-            } else {
-                model
-            }
-        }
-        None => return (StatusCode::BAD_REQUEST, "Missing model").into_response(),
-    };
+    // 检查 provider 是否为对象且包含 url 字段（用于自定义端点，如 deep research）
+    let custom_url = body
+        .get("provider")
+        .and_then(|p| p.as_object())
+        .and_then(|obj| obj.get("url"))
+        .and_then(|u| u.as_str())
+        .map(|s| s.to_string());
 
     // 拿 messages[0]["content"]
     let messages: Value = match body
@@ -365,8 +361,32 @@ pub async fn handle_gemini_forward(
         None => return (StatusCode::BAD_REQUEST, "Missing `messages[0].content`").into_response(),
     };
 
-    // 构建转发 URL
-    let target_url = format!("https://{}/v1beta/models/{}:generateContent", domain, model);
+    // 构建转发 URL，同时获取 model（用于响应）
+    let (target_url, model_name) = if let Some(url_path) = custom_url {
+        // 使用自定义 URL 路径（如 /v1beta/interactions）
+        // 对于自定义端点，model 从 body 中获取（可选）
+        let model = body
+            .get("model")
+            .and_then(|m| m.as_str())
+            .unwrap_or("custom")
+            .to_string();
+        (format!("https://{}{}", domain, url_path), model)
+    } else {
+        // 默认使用 generateContent 端点
+        // Strip the first colon and its prefix from model for this route if present
+        let model = match body.get("model").and_then(|m| m.as_str()) {
+            Some(model) => {
+                if let Some(pos) = model.find(':') {
+                    model[(pos + 1)..].to_string()
+                } else {
+                    model.to_string()
+                }
+            }
+            None => return (StatusCode::BAD_REQUEST, "Missing model").into_response(),
+        };
+        let url = format!("https://{}/v1beta/models/{}:generateContent", domain, model);
+        (url, model)
+    };
 
     // 从 header 读取 authorization，去掉 Bearer 前缀
     let mut forward_headers = reqwest::header::HeaderMap::new();
@@ -410,7 +430,7 @@ pub async fn handle_gemini_forward(
                 Ok(data) => {
                     // 提取 usageMetadata
                     let mut response_json = json!({
-                        "model": model,
+                        "model": model_name,
                         "choices": [{
                             "index": 0,
                             "message": data
